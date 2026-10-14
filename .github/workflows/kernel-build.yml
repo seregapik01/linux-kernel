@@ -1,0 +1,189 @@
+name: kernel-build-runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Версия ядра (tarball с cdn.kernel.org)"
+        required: true
+        default: "7.0.3"
+      localversion:
+        description: "Суффикс в uname -r; поменяй, чтобы старая сборка осталась в VM"
+        required: true
+        default: "-gha"
+      config_flags:
+        description: "CONFIG-флаги поверх runner/kernel-base.config, по одному KEY=VALUE на строку"
+        required: false
+        default: ""
+      upload_vmlinux:
+        description: "Приложить vmlinux (нужен для KGDB/gdb на хосте)"
+        type: boolean
+        default: false
+      retention_days:
+        description: "Сколько дней хранить артефакты"
+        required: false
+        default: "14"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: linux-${{ inputs.kernel_version }} x86_64 to .deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      KERNEL_VERSION: ${{ inputs.kernel_version }}
+      LOCALVERSION_SUFFIX: ${{ inputs.localversion }}
+      CONFIG_FLAGS: ${{ inputs.config_flags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex cpio kmod ccache dwarves \
+            libssl-dev libelf-dev zstd xz-utils \
+            debhelper dpkg-dev fakeroot lsb-release
+
+      - name: Cache kernel tarball
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: linux-tarball-x86-${{ inputs.kernel_version }}
+
+      - name: Download source tarball
+        run: |
+          mkdir -p downloads
+          tarball="downloads/linux-${KERNEL_VERSION}.tar.xz"
+          if [ ! -f "$tarball" ]; then
+            major="${KERNEL_VERSION%%.*}"
+            echo "Downloading linux-${KERNEL_VERSION} (v${major}.x)"
+            curl -fL --retry 3 --retry-delay 5 \
+              -o "$tarball" \
+              "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KERNEL_VERSION}.tar.xz"
+          fi
+
+      - name: Extract source
+        run: |
+          tar -xf "downloads/linux-${KERNEL_VERSION}.tar.xz"
+          test -d "linux-${KERNEL_VERSION}"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-x86-${{ inputs.kernel_version }}-${{ inputs.localversion }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-x86-${{ inputs.kernel_version }}-${{ inputs.localversion }}-
+            ccache-x86-${{ inputs.kernel_version }}-
+
+      - name: Configure kernel (base config + flags)
+        run: |
+          cd "linux-${KERNEL_VERSION}"
+          cp "${GITHUB_WORKSPACE}/runner/kernel-base.config" .config
+          ./scripts/config \
+            --set-str LOCALVERSION "$LOCALVERSION_SUFFIX" \
+            --disable LOCALVERSION_AUTO
+
+          trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<< "$1"; }
+
+          while IFS= read -r raw; do
+            line="$(trim "${raw%%#*}")"
+            [ -z "$line" ] && continue
+            case "$line" in
+              *=*) key="${line%%=*}"; val="${line#*=}" ;;
+              *) echo "::error::Bad flag (expected KEY=VALUE): '$line'"; exit 1 ;;
+            esac
+            case "$val" in
+              y) ./scripts/config --enable  "$key" ;;
+              m) ./scripts/config --module  "$key" ;;
+              n) ./scripts/config --disable "$key" ;;
+              *) ./scripts/config --set-val "$key" "$val" ;;
+            esac
+          done <<< "$CONFIG_FLAGS"
+
+          make olddefconfig
+          make -s kernelrelease | tee kernelrelease.txt
+
+          {
+            echo "## Ядро"
+            echo '```'
+            cat kernelrelease.txt
+            echo '```'
+            echo "## Запрошенные флаги в итоговом .config"
+            echo '```'
+            while IFS= read -r raw; do
+              line="$(trim "${raw%%#*}")"
+              [ -z "$line" ] && continue
+              key="${line%%=*}"
+              grep -E "^${key}=" .config \
+                || grep -E "^# ${key} is not set" .config \
+                || echo "${key}: НЕ НАЙДЕНО (зависимости не выполнены?)"
+            done <<< "$CONFIG_FLAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build deb packages
+        run: |
+          cd "linux-${KERNEL_VERSION}"
+          export PATH="/usr/lib/ccache:$PATH"
+          ccache -M 5G >/dev/null
+          # не собираем linux-image-*-dbg (экономим ~30 мин и гигабайты)
+          export DEB_BUILD_PROFILES=pkg.linux-upstream.nokerneldbg
+          export DEB_BUILD_OPTIONS="parallel=$(nproc)"
+          export DPKG_DEB_COMPRESSOR_TYPE=xz
+          make -j"$(nproc)" \
+            KDEB_PKGVERSION="${KERNEL_VERSION}${LOCALVERSION_SUFFIX}-1" \
+            bindeb-pkg
+
+      - name: Collect deb packages
+        run: |
+          mkdir -p out
+          find . -maxdepth 2 -name 'linux-image-*.deb'   ! -path './out/*' -exec mv {} out/ \;
+          find . -maxdepth 2 -name 'linux-headers-*.deb' ! -path './out/*' -exec mv {} out/ \;
+          shopt -s nullglob
+          images=(out/linux-image-*.deb)
+          if [ ${#images[@]} -eq 0 ]; then
+            echo "::error::linux-image-*.deb не найден"
+            exit 1
+          fi
+          ls -lh out/
+          {
+            echo "## Артефакты"
+            echo '```'
+            ls -1 out/
+            echo '```'
+            echo "В VM: \`sudo dpkg -i linux-image-*.deb\` → \`update-grub\` → \`reboot\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload kernel debs
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-debs-${{ inputs.kernel_version }}${{ inputs.localversion }}-amd64
+          path: out/linux-*.deb
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+          if-no-files-found: error
+
+      - name: Pack vmlinux (for KGDB)
+        if: ${{ inputs.upload_vmlinux }}
+        run: |
+          zstd -10 -T0 -f \
+            "linux-${KERNEL_VERSION}/vmlinux" \
+            -o "vmlinux-${KERNEL_VERSION}${LOCALVERSION_SUFFIX}.zst"
+          ls -lh vmlinux-*.zst
+
+      - name: Upload vmlinux
+        if: ${{ inputs.upload_vmlinux }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmlinux-${{ inputs.kernel_version }}${{ inputs.localversion }}
+          path: vmlinux-*.zst
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+          if-no-files-found: error
