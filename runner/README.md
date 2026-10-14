@@ -1,28 +1,30 @@
 # Kernel build runner (GitHub Actions → .deb → UTM)
 
-Ядро **x86_64** собирается в GitHub Actions, артефактом отдаются готовые
-`.deb` пакеты. Ноутбук в сборке не участвует.
+Builds an **x86_64** kernel on GitHub Actions and ships ready-to-install
+`.deb` packages as artifacts. Your laptop takes no part in the build.
 
-## Поток
+## Workflow
 
-1. Запушь ветку `ci/kernel-build-runner` в GitHub.
+1. Push the `ci/kernel-build-runner` branch to GitHub.
 2. GitHub → **Actions** → **kernel-build-runner** → **Run workflow**.
-3. Заполни параметры:
-   | Поле | Что делает | По умолчанию |
+3. Fill in the inputs:
+
+   | Input | Meaning | Default |
    |---|---|---|
-   | `kernel_version` | версия ядра с kernel.org | `7.0.3` |
-   | `localversion` | суффикс в `uname -r` | `-gha` |
-   | `config_flags` | твои CONFIG-флаги поверх `runner/kernel-base.config` | пусто |
-   | `upload_vmlinux` | приложить `vmlinux` (нужен для KGDB/gdb на хосте) | `false` |
-   | `retention_days` | срок хранения артефакта | `14` |
-4. По окончании (зелёный билд) скачай артефакт
-   `kernel-debs-<версия><суффикс>-amd64` со страницы запуска.
-5. Перекинь `.deb` в VM (общая папка UTM или scp) и запусти
+   | `kernel_version` | kernel version from kernel.org | `7.0.3` |
+   | `localversion` | suffix in `uname -r` | `-gha` |
+   | `config_flags` | your CONFIG flags on top of `runner/kernel-base.config` | empty |
+   | `upload_vmlinux` | also upload `vmlinux` (needed for KGDB/gdb on the host) | `false` |
+   | `retention_days` | artifact retention, days | `14` |
+
+4. When the build is green, download the
+   `kernel-debs-<version><suffix>-amd64` artifact from the run page.
+5. Move the `.deb` files into the VM (UTM shared folder or scp) and run
    [vm-install.sh](vm-install.sh).
 
-## Примеры `config_flags`
+## `config_flags` examples
 
-По одному `KEY=VALUE` на строку. Значения: `y`, `m`, `n` или строка/число.
+One `KEY=VALUE` per line. Values: `y`, `m`, `n`, or a string/number.
 
 ```text
 CONFIG_KGDB=y
@@ -31,36 +33,38 @@ CONFIG_KGDB_KDB=y
 CONFIG_RANDOMIZE_BASE=n
 ```
 
-`RANDOMIZE_BASE=n` (KASLR off) — чтобы адреса в gdb совпадали с символами.
-Итоговые значения всех запрошенных флагов видны в **Summary** запуска —
-проверь, что флаг не «съели» зависимости (`=m` там, где просил `=y`, и т.п.).
+`RANDOMIZE_BASE=n` (KASLR off) — so that gdb addresses match the symbols.
+The final values of all requested flags are shown in the run **Summary** —
+check that kconfig dependencies did not override your flag (`=m` where you
+asked for `=y`, and so on).
 
-## Установка в VM
+## Installing into the VM
 
 ```bash
-# внутри Debian (UTM), в папке с распакованными .deb
+# inside Debian (UTM), in the folder with the unpacked .deb files
 sudo ./vm-install.sh
 sudo reboot
-uname -r   # должно показать 7.0.3-gha (или твой суффикс)
+uname -r   # should show 7.0.3-gha (or your suffix)
 ```
 
-`dpkg -i` сам вызывает хуки: `update-initramfs` и `update-grub`.
-Старое ядро `6.1.0-50-amd64` остаётся в меню grub → откат в любой момент:
-**Advanced options for Debian GNU/Linux** → старое ядро.
+`dpkg -i` triggers the Debian hooks itself: `update-initramfs` and
+`update-grub`. The old `6.1.0-50-amd64` kernel stays in the grub menu, so
+you can roll back at any time via **Advanced options for Debian GNU/Linux**
+→ the old kernel.
 
-## Нюансы
+## Notes
 
-- Базовый конфиг: [kernel-base.config](kernel-base.config) (копия
-  `HW_01_build_kernel/.config`). Хочешь другой — правь его или передай
-  флагами.
-- `-dbg` пакет не собирается (профиль `nokerneldbg`) — экономит ~30 минут
-  и гигабайты. Отладочные символы в самом ядре остаются (`DEBUG_INFO=y`).
-- Каждая сборка с **новым** `localversion` (`-gha2`, `-gha3`, ...) ставится
-  в VM рядом со старой — удобно сравнивать. С тем же суффиксом `dpkg -i`
-  просто перезапишет предыдущую.
-- Первый билд на бесплатном раннере (4 vCPU) — примерно 60–120 минут,
-  повторные с тёплым ccache-кэшем — заметно быстрее.
-  В **public** репозитории Actions бесплатны и без лимита минут;
-  в private лимитируется (2000 мин/мес на free-плане).
-- `vmlinux` артефакт нужен, когда отлаживаешь через KGDB с хоста:
-  `zstd -d vmlinux-*.zst`, затем в gdb `file vmlinux` + `target remote`.
+- Base config: [kernel-base.config](kernel-base.config) (a copy of
+  `HW_01_build_kernel/.config`). Edit it or override with flags to change it.
+- The `-dbg` package is not built (the `nokerneldbg` profile) — saves
+  ~30 minutes and gigabytes. Debug symbols remain in the kernel itself
+  (`DEBUG_INFO=y`).
+- Each build with a **new** `localversion` (`-gha2`, `-gha3`, ...) is
+  installed in the VM next to the old one — handy for comparing. The same
+  suffix simply overwrites the previous build via `dpkg -i`.
+- The first build on a free runner (4 vCPU) takes about 60–120 minutes;
+  later runs with a warm ccache are much faster. Actions are free and
+  unlimited for **public** repositories; private ones consume minutes
+  (2000/month on the free plan).
+- The `vmlinux` artifact is needed when debugging over KGDB from the host:
+  `zstd -d vmlinux-*.zst`, then in gdb `file vmlinux` + `target remote`.

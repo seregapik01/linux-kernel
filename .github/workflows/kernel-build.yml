@@ -4,23 +4,23 @@ on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: "Версия ядра (tarball с cdn.kernel.org)"
+        description: "Kernel version (tarball from cdn.kernel.org)"
         required: true
         default: "7.0.3"
       localversion:
-        description: "Суффикс в uname -r; поменяй, чтобы старая сборка осталась в VM"
+        description: "Suffix in uname -r; change it to keep the old build in the VM"
         required: true
         default: "-gha"
       config_flags:
-        description: "CONFIG-флаги поверх runner/kernel-base.config, по одному KEY=VALUE на строку"
+        description: "CONFIG flags on top of runner/kernel-base.config, one KEY=VALUE per line"
         required: false
         default: ""
       upload_vmlinux:
-        description: "Приложить vmlinux (нужен для KGDB/gdb на хосте)"
+        description: "Also upload vmlinux (needed for KGDB/gdb on the host)"
         type: boolean
         default: false
       retention_days:
-        description: "Сколько дней хранить артефакты"
+        description: "Artifact retention, days"
         required: false
         default: "14"
 
@@ -113,11 +113,11 @@ jobs:
           make -s kernelrelease | tee kernelrelease.txt
 
           {
-            echo "## Ядро"
+            echo "## Kernel"
             echo '```'
             cat kernelrelease.txt
             echo '```'
-            echo "## Запрошенные флаги в итоговом .config"
+            echo "## Requested flags in the final .config"
             echo '```'
             while IFS= read -r raw; do
               line="$(trim "${raw%%#*}")"
@@ -125,7 +125,7 @@ jobs:
               key="${line%%=*}"
               grep -E "^${key}=" .config \
                 || grep -E "^# ${key} is not set" .config \
-                || echo "${key}: НЕ НАЙДЕНО (зависимости не выполнены?)"
+                || echo "${key}: NOT FOUND (unsatisfied kconfig dependencies?)"
             done <<< "$CONFIG_FLAGS"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -135,7 +135,7 @@ jobs:
           cd "linux-${KERNEL_VERSION}"
           export PATH="/usr/lib/ccache:$PATH"
           ccache -M 5G >/dev/null
-          # не собираем linux-image-*-dbg (экономим ~30 мин и гигабайты)
+          # skip the linux-image-*-dbg package (saves ~30 min and gigabytes)
           export DEB_BUILD_PROFILES=pkg.linux-upstream.nokerneldbg
           export DEB_BUILD_OPTIONS="parallel=$(nproc)"
           export DPKG_DEB_COMPRESSOR_TYPE=xz
@@ -151,16 +151,16 @@ jobs:
           shopt -s nullglob
           images=(out/linux-image-*.deb)
           if [ ${#images[@]} -eq 0 ]; then
-            echo "::error::linux-image-*.deb не найден"
+            echo "::error::linux-image-*.deb not found"
             exit 1
           fi
           ls -lh out/
           {
-            echo "## Артефакты"
+            echo "## Artifacts"
             echo '```'
             ls -1 out/
             echo '```'
-            echo "В VM: \`sudo dpkg -i linux-image-*.deb\` → \`update-grub\` → \`reboot\`"
+            echo "In the VM: \`sudo dpkg -i linux-image-*.deb\` → \`update-grub\` → \`reboot\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload kernel debs
