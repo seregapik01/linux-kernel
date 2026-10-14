@@ -1,0 +1,18 @@
+# локальные исходники/сборки ядра и артефакты
+linux-*/
+downloads/
+out/
+*.deb
+*.tar.xz
+*.zst
+
+# сборочные файлы модулей (HW_02)
+*.o
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
